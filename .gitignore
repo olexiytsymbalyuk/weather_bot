@@ -1,0 +1,23 @@
+# Секрети (API-ключі, токени)
+.env
+
+# Віртуальне середовище Python
+.venv/
+
+# Кеш Python
+__pycache__/
+*.py[cod]
+
+# Лог-файл бота (створюється автоматично)
+bot_log.csv
+
+# IDE (JetBrains / PyCharm)
+.idea/
+.jbeval/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# macOS
+.DS_Store
