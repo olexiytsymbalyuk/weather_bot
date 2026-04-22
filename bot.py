@@ -31,6 +31,8 @@ import matplotlib.pyplot as plt  # побудова графіків
 
 import pandas as pd  # pandas — бібліотека для аналізу табличних даних (DataFrame)
 
+import psycopg2  # драйвер PostgreSQL (той самий, що у sql_basics.py)
+
 import requests  # HTTP-запити до зовнішніх API
 
 from telegram import Update  # об'єкт оновлення від Telegram
@@ -66,6 +68,16 @@ if not TELEGRAM_TOKEN or not WEATHER_API_KEY:
 
 # Шлях до CSV-файлу, де зберігатимуться логи запитів
 LOG_FILE = Path("bot_log.csv")
+
+# ── Налаштування PostgreSQL ──
+# Ті самі змінні, що й у sql_basics.py. Бот пише запити паралельно:
+# і в CSV (для pandas-аналітики), і в таблицю weather_log (для SQL-аналітики).
+# Якщо БД недоступна — бот продовжує працювати, пишучи тільки в CSV.
+DB_NAME = os.getenv("DB_NAME", "weather_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
 
 # Налаштування логування (для дебагу в консолі)
 logging.basicConfig(
@@ -105,6 +117,92 @@ def log_request(user_id: int, username: str, city: str, temp: float, feels_like:
             feels_like,
             description,
         ])
+
+
+# ══════════════════════════════════════════════
+# 1b. БАЗА ДАНИХ — паралельно з CSV пишемо в PostgreSQL
+# ══════════════════════════════════════════════
+# Чому паралельно? CSV — простий формат для pandas (урок №1),
+# а PostgreSQL — справжня база даних для SQL-запитів (урок №2 — sql_basics.py).
+# Пишемо одні й ті самі дані в обидва місця, щоб на одному боті можна було
+# вчити і pandas, і SQL.
+#
+# Схема таблиці weather_log точно така сама, як у sql_basics.py:
+# timestamp, user_id, username, city, temp, feels_like, description.
+
+# Одне глобальне з'єднання з БД — відкриваємо раз, перевикористовуємо для всіх запитів.
+# Відкривати нове з'єднання на кожне повідомлення — повільно й марнотратно.
+_db_conn = None
+
+
+def get_db_conn():
+    """Повертає активне з'єднання з PostgreSQL, перепідключаючись за потреби."""
+    global _db_conn
+    # conn.closed == 0 означає "живе". Якщо з'єднання ще не створене
+    # або було закрите (наприклад, після втрати мережі) — створюємо нове.
+    if _db_conn is None or _db_conn.closed:
+        _db_conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        # autocommit = True: кожен INSERT фіксується одразу, без conn.commit().
+        _db_conn.autocommit = True
+    return _db_conn
+
+
+def init_db():
+    """Створює таблицю weather_log, якщо її ще немає.
+
+    На відміну від sql_basics.py (який робить DROP TABLE для чистого старту уроку),
+    бот НЕ видаляє існуючі дані — тільки додає нові записи.
+    CREATE TABLE IF NOT EXISTS — створити тільки якщо таблиці ще не існує.
+    """
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS weather_log (
+                    id          SERIAL PRIMARY KEY,
+                    timestamp   TIMESTAMP NOT NULL,
+                    user_id     INTEGER NOT NULL,
+                    username    VARCHAR(100) NOT NULL,
+                    city        VARCHAR(100) NOT NULL,
+                    temp        REAL NOT NULL,
+                    feels_like  REAL NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+        logger.info("✅ PostgreSQL підключено, таблиця weather_log готова.")
+    except Exception as e:
+        # Бот не повинен падати, якщо БД недоступна — просто працюватимемо без неї.
+        logger.warning(f"⚠️  PostgreSQL недоступний: {e}. Бот писатиме тільки у CSV.")
+
+
+def log_to_db(user_id: int, username: str, city: str, temp: float, feels_like: float, description: str):
+    """Додає один рядок у таблицю weather_log (PostgreSQL).
+
+    Використовуємо параметризований запит (%s) — так само, як у sql_basics.py.
+    Це захищає від SQL-ін'єкцій (наприклад, якщо хтось введе місто з лапками
+    або спецсимволами — psycopg2 автоматично їх екранує).
+    """
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO weather_log
+                    (timestamp, user_id, username, city, temp, feels_like, description)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (datetime.now(), user_id, username, city, temp, feels_like, description),
+            )
+    except Exception as e:
+        # Якщо БД лягла посеред дня — не зриваємо відповідь користувачу,
+        # лог просто осяде тільки в CSV.
+        logger.warning(f"⚠️  Не вдалося записати в PostgreSQL: {e}")
 
 
 # ══════════════════════════════════════════════
@@ -188,9 +286,20 @@ async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Не знайшов місто «{city}». Спробуй ще раз.")
         return
 
-    # Логуємо запит у CSV — ці дані потім аналізуватимемо через pandas
+    # Логуємо запит паралельно у ДВА місця:
+    #   1) CSV — для уроку pandas (/stats, /plot читають звідти)
+    #   2) PostgreSQL — для уроку SQL (таблицю weather_log аналізуємо у sql_basics.py)
+    # Обидва записи незалежні: якщо один із них впаде, другий все одно виконається.
     user = update.effective_user
     log_request(
+        user_id=user.id,
+        username=user.username or user.first_name or "unknown",
+        city=data["city"],
+        temp=data["temp"],
+        feels_like=data["feels_like"],
+        description=data["description"],
+    )
+    log_to_db(
         user_id=user.id,
         username=user.username or user.first_name or "unknown",
         city=data["city"],
@@ -406,6 +515,10 @@ async def plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     # Ініціалізуємо CSV-файл для логування (створюємо заголовки, якщо файлу ще немає)
     init_log()
+
+    # Ініціалізуємо базу даних — створюємо таблицю weather_log, якщо її ще немає.
+    # Якщо PostgreSQL недоступний, функція просто попередить у лог і бот запуститься без БД.
+    init_db()
 
     # Створюємо додаток з нашим Telegram-токеном (завантаженим з .env)
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
