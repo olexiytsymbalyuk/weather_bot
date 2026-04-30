@@ -205,6 +205,40 @@ def log_to_db(user_id: int, username: str, city: str, temp: float, feels_like: f
         logger.warning(f"⚠️  Не вдалося записати в PostgreSQL: {e}")
 
 
+def get_top_cities_sql(limit: int = 5):
+    """Повертає топ-N міст за кількістю запитів із PostgreSQL.
+
+    Демонстрація уроку №3 (sql_groupby.py): GROUP BY + ORDER BY + LIMIT.
+    SQL-аналог pandas-функції з /stats:
+        df["city"].value_counts().head(N)
+
+    Повертає список кортежів [(city, count), ...] або None, якщо БД недоступна.
+    Хендлер /top_cities на основі None покаже користувачу зрозумілу помилку.
+    """
+    try:
+        conn = get_db_conn()
+        with conn.cursor() as cur:
+            # Параметризований запит (%s) — limit підставляється безпечно.
+            # GROUP BY city — розбиваємо рядки в купки за містом.
+            # COUNT(*) AS query_count — рахуємо кожну купку, даємо ім'я колонці.
+            # ORDER BY query_count DESC — найбільші купки зверху.
+            # LIMIT %s — лишаємо тільки N перших.
+            cur.execute(
+                """
+                SELECT city, COUNT(*) AS query_count
+                FROM weather_log
+                GROUP BY city
+                ORDER BY query_count DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return cur.fetchall()
+    except Exception as e:
+        logger.warning(f"⚠️  PostgreSQL запит /top_cities впав: {e}")
+        return None
+
+
 # ══════════════════════════════════════════════
 # 2. WEATHER API — отримуємо погоду з OpenWeatherMap
 # ══════════════════════════════════════════════
@@ -254,9 +288,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привіт! Я погодний бот з аналітикою.\n\n"
         "Просто напиши назву міста — і я покажу погоду.\n\n"
         "Команди:\n"
-        "/stats — статистика запитів\n"
+        "/stats — статистика запитів (pandas з CSV)\n"
         "/plot — графік температур\n"
         "/plot Київ — графік для одного міста\n"
+        "/top_cities — топ-5 міст (SQL з PostgreSQL)\n"
         "/help — допомога"
     )
 
@@ -266,9 +301,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Напиши назву міста — отримаєш погоду.\n\n"
         "Кожен запит зберігається, тому:\n"
-        "/stats — покаже зведену статистику\n"
+        "/stats — зведена статистика через pandas (читає CSV)\n"
         "/plot — намалює графік температур\n"
-        "/plot Київ — графік тільки для Києва"
+        "/plot Київ — графік тільки для Києва\n"
+        "/top_cities — те саме, що /stats, але через SQL GROUP BY на PostgreSQL"
     )
 
 
@@ -414,6 +450,52 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def top_cities(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Команда /top_cities — топ-5 міст із PostgreSQL через SQL-агрегацію.
+
+    ╔══════════════════════════════════════════════════════════════╗
+    ║  Це урок №3 (sql_groupby.py) у дії!                          ║
+    ║  На відміну від /stats (pandas, читає CSV), ця команда       ║
+    ║  читає з PostgreSQL через GROUP BY + ORDER BY + LIMIT.       ║
+    ║                                                              ║
+    ║  SQL-запит:                                                  ║
+    ║      SELECT city, COUNT(*) AS query_count                    ║
+    ║      FROM weather_log                                        ║
+    ║      GROUP BY city                                           ║
+    ║      ORDER BY query_count DESC                               ║
+    ║      LIMIT 5                                                 ║
+    ║                                                              ║
+    ║  pandas-аналог (з /stats):                                   ║
+    ║      df["city"].value_counts().head(5)                       ║
+    ╚══════════════════════════════════════════════════════════════╝
+    """
+    rows = get_top_cities_sql(limit=5)
+
+    # rows == None — БД недоступна (не запущено / погані креденшіали).
+    # У цьому випадку бот не падає, просто пропонує альтернативу.
+    if rows is None:
+        await update.message.reply_text(
+            "❌ База даних недоступна. Спробуй пізніше або скористайся /stats."
+        )
+        return
+
+    # rows == [] — БД працює, але таблиця порожня.
+    if not rows:
+        await update.message.reply_text(
+            "📊 Поки немає запитів у базі. Запитай погоду для якогось міста!"
+        )
+        return
+
+    # rows — це список кортежів [(city, count), ...], відсортований від більшого.
+    text = "🏆 Топ-5 міст за запитами (SQL з PostgreSQL):\n\n"
+    for i, (city, count) in enumerate(rows, 1):
+        text += f"{i}. {city} — {count} запитів\n"
+    text += "\n💡 SQL: SELECT city, COUNT(*) ... GROUP BY city ORDER BY ... LIMIT 5"
+
+    await update.message.reply_text(text)
+
+
 async def plot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Команда /plot — графік температур.
@@ -528,6 +610,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("plot", plot))
+    app.add_handler(CommandHandler("top_cities", top_cities))
 
     # Текстові повідомлення (не команди) — обробляємо як назву міста
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, weather))
