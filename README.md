@@ -13,6 +13,9 @@
 | `pandas` | Аналіз даних (DataFrame, groupby, value_counts, агрегатні функції) |
 | `matplotlib` | Побудова графіків температур |
 | `python-dotenv` | Завантаження токенів з `.env` файлу |
+| `psycopg2` | PostgreSQL-драйвер (уроки 2-4: SQL, GROUP BY, JOIN) |
+| `bcrypt` | Хешування паролів (урок 5) |
+| `cryptography` | Симетричне шифрування Fernet (урок 5) |
 
 ## Встановлення
 
@@ -53,6 +56,7 @@ python bot.py
 | `/plot` | Графік температур по всіх містах |
 | `/plot Київ` | Графік температур для конкретного міста |
 | `/top_cities` | Топ-5 міст через SQL `GROUP BY` з PostgreSQL (урок 3) |
+| `/me` | Особиста статистика через SQL `JOIN` трьох таблиць (урок 4) |
 | *будь-який текст* | Показує погоду для вказаного міста |
 
 ## Pandas-операції в коді
@@ -77,9 +81,11 @@ python bot.py
 
 ```
 weather_bot/
-  bot.py             # Telegram-бот з погодою (урок pandas + SQL у /top_cities)
+  bot.py             # Telegram-бот з погодою (урок pandas + SQL у /top_cities, /me)
   sql_basics.py      # основи SQL через PostgreSQL (урок 2)
   sql_groupby.py     # GROUP BY та агрегатні функції (урок 3)
+  sql_join.py        # JOIN трьох таблиць (урок 4)
+  crypto_basics.py   # хешування + симетричне шифрування (урок 5)
   .env               # токени та паролі (не комітити!)
   .env.example       # шаблон для .env
   requirements.txt   # залежності
@@ -173,3 +179,132 @@ LIMIT 5;
 ```
 
 Поруч з нею `/stats` робить рівно той самий підрахунок через `df["city"].value_counts().head(5)` у pandas — учні можуть запустити обидві команди й порівняти результати.
+
+---
+
+# SQL JOIN — З'єднання таблиць (урок 4)
+
+Четвертий урок курсу. Продовжує `sql_groupby.py`: тепер у нас не одна таблиця, а **три** (`weather_log`, `users`, `cities`), і ми вчимося з'єднувати їх через **JOIN**.
+
+Кінцева ідея уроку — учні бачать, що `JOIN ... ON ...` у SQL — це майже дослівний переклад `pd.merge(left, right, on=...)` у pandas. Те ж саме мислення, інша мова.
+
+## Що покрито
+
+| Крок | Тема | Ключові SQL-конструкції |
+|------|------|-------------------------|
+| 1 | INNER JOIN — основа основ | `JOIN ... ON`, `AS`-псевдоніми таблиць, колізія імен колонок |
+| 2 | LEFT JOIN — "усі ліві, навіть без пари" | NULL з правої таблиці, `IS NULL` для пошуку юзерів без запитів |
+| 3 | RIGHT JOIN та FULL OUTER JOIN | Симетрія LEFT/RIGHT, FULL OUTER для синхронізації двох списків |
+| 4 | JOIN трьох таблиць | `weather_log JOIN users JOIN cities` + GROUP BY поверх; `IS DISTINCT FROM` |
+| 5 | Self JOIN — таблиця сама з собою | Знаходження пар рядків в одній таблиці |
+| 6 | Pandas-міст | `pd.read_sql_query` + `pd.merge(how="inner"/"left"/"outer")` |
+
+## Структура даних
+
+Урок не ламає схему `weather_log` (учні вже з нею знайомі). Замість цього додає поряд дві довідкові таблиці:
+
+- `users` — `user_id`, `username`, `first_seen`, `language`, `home_city` (може бути `NULL`)
+- `cities` — `name`, `country`, `region`, `population`, `latitude`, `longitude`
+
+У тестових даних навмисно є "сирітські" рядки:
+- юзер `оля_к` — є в `users`, але не зробив жодного запиту → демо LEFT JOIN
+- міста `Полтава`, `Чернівці` — є в `cities`, але ніхто їх не запитував → демо RIGHT/FULL OUTER JOIN
+- юзер `ірина_с` — `home_city = NULL` → демо `IS DISTINCT FROM`
+
+## Запуск
+
+```bash
+python sql_join.py
+```
+
+Скрипт перестворює всі три таблиці на свіжих даних і прогонить усі 6 кроків.
+
+## SQL у боті: команда `/me`
+
+У `bot.py` додано команду `/me`, яка робить запит з **JOIN трьох таблиць** і повертає особисту статистику юзера:
+
+```sql
+SELECT
+    u.username,
+    u.language,
+    u.home_city,
+    COUNT(w.id) AS requests,
+    (SELECT c.region
+     FROM weather_log w2
+     JOIN cities c ON w2.city = c.name
+     WHERE w2.user_id = u.user_id
+     GROUP BY c.region
+     ORDER BY COUNT(*) DESC
+     LIMIT 1) AS top_region
+FROM users u
+LEFT JOIN weather_log w ON u.user_id = w.user_id
+WHERE u.user_id = %s
+GROUP BY u.user_id, u.username, u.language, u.home_city;
+```
+
+Учень може спочатку запустити `python sql_join.py` (отримати тестові дані для 6 юзерів), а далі побачити, як та сама ідея з JOIN-ом працює в реальному боті.
+
+---
+
+# Crypto Basics — Хешування + симетричне шифрування (урок 5)
+
+П'ятий урок курсу. Окремий трек — **безпека даних**. Не залежить від SQL-уроків. Сценарій береться з нашого ж бота: у `bot_log.csv` зберігаються `user_id` (персональні дані), у `.env` лежать API-токени.
+
+Дві базові ідеї криптографії, які закривають ці сценарії:
+
+| Що робимо | Інструмент | Сценарій у боті |
+|---|---|---|
+| Одностороннє перетворення для приватності | `hashlib.sha256` + сіль | `user_id` → хеш у `bot_log.csv` |
+| Двостороннє шифрування секретів | `cryptography.fernet.Fernet` | Шифрування `WEATHER_API_KEY` (демо) |
+
+## Що покрито
+
+| Крок | Тема | Ключові інструменти |
+|------|------|---------------------|
+| 1 | Що таке хеш-функція | `hashlib.sha256`, властивості (детермінованість, лавинний ефект) |
+| 2 | MD5/SHA-1 — антипатерн | Чому НЕ використовувати; rainbow-table як приклад атаки |
+| 3 | Salt | `secrets.token_bytes`, навіщо солити паролі |
+| 4 | bcrypt — правильно для паролів | `bcrypt.hashpw`, `bcrypt.checkpw`, cost factor |
+| 5 | HMAC — підпис повідомлень | `hmac.new(key, msg, sha256)`, `hmac.compare_digest` (timing attack) |
+| 6 | Симетричне шифрування | `Fernet.generate_key`, `encrypt/decrypt`, IV, перевірка цілісності |
+| 7 | Зберігання ключів | `.env` як сховище, антипатерни (захардкодити ключ у код) |
+
+## Залежності
+
+```bash
+pip install bcrypt cryptography
+```
+
+(Або просто `pip install -r requirements.txt` — вони вже там.)
+
+## Запуск
+
+```bash
+python crypto_basics.py
+```
+
+Скрипт прогонить усі 7 кроків з форматованим виводом і покаже практичний приклад інтеграції з ботом.
+
+## Інтеграція в бота: хешування `user_id` у логах
+
+У `bot.py` функція `log_request()` тепер хешує `user_id` через SHA-256 з сіллю:
+
+```python
+def hash_user_id(uid: int) -> str:
+    return hashlib.sha256(USER_ID_SALT.encode() + str(uid).encode()).hexdigest()
+```
+
+Що це дає:
+- `bot_log.csv` більше не містить plain Telegram `user_id` — лише хеші.
+- `/stats` далі правильно рахує `df["user_id"].nunique()`, бо однакові `user_id` дають однакові хеші.
+- Витечка `bot_log.csv` не розкриває, ХТО запитував — лише факт запитів.
+
+Щоб увімкнути сіль — додай `USER_ID_SALT` у `.env` (приклад в `.env.example`):
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+Скопіюй вивід у `.env` як значення `USER_ID_SALT=...`.
+
+> Якщо `USER_ID_SALT` порожній, бот стартує з попередженням, але працює — хешує без солі (краще, ніж plain, але слабше за хеш з сіллю).
